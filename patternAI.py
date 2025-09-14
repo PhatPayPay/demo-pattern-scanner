@@ -66,11 +66,11 @@ def retry_ccxt_call(func, max_retries=3, delay=5):
         except Exception as e:
             raise e
 
-# Updated to add market_cap and retry logic, switched to Bybit
+# Updated to add market_cap and retry logic, switched to OKX
 @st.cache_data(ttl=300)  # Cache for 5 minutes to reduce API calls
 def get_top_usdt_coins(n=50, vol_change_threshold=10):
     def safe_fetch():
-        exchange = ccxt.bybit({
+        exchange = ccxt.okx({
             'enableRateLimit': True,
             'timeout': 30000,  # 30s timeout
             'options': {'defaultType': 'spot'}
@@ -136,7 +136,7 @@ def get_top_usdt_coins(n=50, vol_change_threshold=10):
     return safe_fetch()
 
 def fetch_ohlcv(symbol, timeframe='1d', limit=500):
-    exchange = ccxt.bybit({
+    exchange = ccxt.okx({
         'enableRateLimit': True,
         'timeout': 30000,
         'options': {'defaultType': 'spot'}
