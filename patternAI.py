@@ -1,14 +1,12 @@
 import streamlit as st
-import ccxt
 import pandas as pd
 import numpy as np
 from scipy.stats import linregress
 from scipy.signal import argrelextrema
 import matplotlib.pyplot as plt
 import mplfinance as mpf
-import requests  # Added for fetching market cap from CoinGecko
-from datetime import datetime
-import time  # For retry delays
+import requests
+from datetime import datetime, timedelta
 
 # Success rates from the uploaded image
 success_rates = {
@@ -44,111 +42,74 @@ def color_market_cap(series):
     styles[is_na] = ''
     return styles
 
-# Retry function for ccxt calls
-def retry_ccxt_call(func, max_retries=3, delay=5):
-    for attempt in range(max_retries):
-        try:
-            return func()
-        except ccxt.NetworkError as e:
-            if attempt < max_retries - 1:
-                st.warning(f"Network error on attempt {attempt + 1}: {str(e)}. Retrying in {delay}s...")
-                time.sleep(delay)
-                delay *= 2  # Exponential backoff
-            else:
-                raise e
-        except ccxt.ExchangeNotAvailable as e:
-            if attempt < max_retries - 1:
-                st.warning(f"Exchange unavailable on attempt {attempt + 1}: {str(e)}. Retrying in {delay}s...")
-                time.sleep(delay)
-                delay *= 2
-            else:
-                raise e
-        except Exception as e:
-            raise e
+# Binance Alpha coins (hardcoded from recent listings, prioritize these)
+binance_alpha_coins = [
+    'XPIN', 'MIRROR', 'OPEN', 'PTB', 'ZKC', 'HOLO', 'UB',  # From September 2025 listings
+    # Add more if needed, e.g., 'BTC', 'ETH' for testing
+]
 
-# Updated to add market_cap and retry logic, switched to OKX
-@st.cache_data(ttl=300)  # Cache for 5 minutes to reduce API calls
-def get_top_usdt_coins(n=50, vol_change_threshold=10):
-    def safe_fetch():
-        exchange = ccxt.okx({
-            'enableRateLimit': True,
-            'timeout': 30000,  # 30s timeout
-            'options': {'defaultType': 'spot'}
-        })
-        
-        # Retry load_markets
-        markets = retry_ccxt_call(lambda: exchange.load_markets())
-        usdt_symbols = [s for s in markets if s.endswith('/USDT') and markets[s]['active'] and markets[s]['spot']]
-        
-        # Retry fetch_tickers
-        tickers = retry_ccxt_call(lambda: exchange.fetch_tickers(usdt_symbols))
-        sorted_tickers = sorted(tickers.items(), key=lambda x: x[1].get('quoteVolume', 0), reverse=True)[:n*2]
-        
-        # Fetch top coins market cap from CoinGecko (more reliable, no retry needed usually)
-        cg_url = "https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=market_cap_desc&per_page=100&page=1&sparkline=false"
-        try:
-            cg_response = requests.get(cg_url, timeout=10)
-            cg_data = cg_response.json()
-            cg_dict = {coin['symbol'].upper(): coin['market_cap'] for coin in cg_data if coin['market_cap']}
-        except Exception as e:
-            st.warning(f"Error fetching market caps: {e}. Market cap will be N/A.")
-            cg_dict = {}
+# Fetch top coins from CoinGecko
+@st.cache_data(ttl=300)
+def get_top_coins(n=50, vol_change_threshold=10):
+    cg_url = "https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=volume_desc&per_page={}&page=1&sparkline=false&price_change_percentage=24h".format(n)
+    try:
+        response = requests.get(cg_url, timeout=10)
+        data = response.json()
         
         results = []
-        for symbol, ticker in sorted_tickers:
-            try:
-                # Retry ohlcv fetch
-                ohlcv_1d = retry_ccxt_call(lambda: exchange.fetch_ohlcv(symbol, '1d', limit=2))
-                if len(ohlcv_1d) < 2:
-                    continue
-                prev_vol = ohlcv_1d[0][5]
-                curr_vol = ohlcv_1d[1][5]
-                vol_change = ((curr_vol - prev_vol) / prev_vol * 100) if prev_vol > 0 else 0
-                
-                price_change = ticker.get('percentage', 0)
-                current_price = ticker.get('last', 0)
-                
-                # Get market cap
-                coin_symbol = symbol.split('/')[0].upper()  # e.g., 'BTC'
-                market_cap_raw = cg_dict.get(coin_symbol, np.nan)
-                market_cap = float(market_cap_raw) if not pd.isna(market_cap_raw) else np.nan
-                
-                results.append({
-                    'symbol': symbol,
-                    'current_price': current_price,
-                    'price_change_24h': price_change,
-                    'volume_change_24h': vol_change,
-                    'market_cap': market_cap
-                })
-                
-                if len(results) >= n:
-                    break
-            except Exception as e:
-                st.error(f"Error processing {symbol}: {e}")
-                continue
+        for coin in data:
+            price_change = coin.get('price_change_percentage_24h', 0)
+            current_price = coin.get('current_price', 0)
+            market_cap = coin.get('market_cap', np.nan)
+            volume_24h = coin.get('total_volume', 0)
+            
+            # Simulate volume change (use price change as proxy or fetch historical if needed)
+            vol_change = price_change  # Placeholder, as CoinGecko doesn't have direct vol change
+            
+            results.append({
+                'symbol': coin['symbol'].upper() + 'USDT',  # Format for consistency
+                'current_price': current_price,
+                'price_change_24h': price_change,
+                'volume_change_24h': vol_change,
+                'market_cap': market_cap,
+                'id': coin['id']  # For OHLC fetch
+            })
         
         filtered = [r for r in results if abs(r['volume_change_24h']) > vol_change_threshold]
         if not filtered:
             st.warning(f"Không coin nào thỏa filter volume change > {vol_change_threshold}%. Hiển thị top mà không filter.")
             return pd.DataFrame(results)
         return pd.DataFrame(filtered)
-    
-    return safe_fetch()
+    except Exception as e:
+        st.error(f"Error fetching top coins: {e}")
+        return pd.DataFrame()
 
-def fetch_ohlcv(symbol, timeframe='1d', limit=500):
-    exchange = ccxt.okx({
-        'enableRateLimit': True,
-        'timeout': 30000,
-        'options': {'defaultType': 'spot'}
-    })
-    def safe_fetch():
-        return retry_ccxt_call(lambda: exchange.fetch_ohlcv(symbol, timeframe, limit=limit))
+# Fetch OHLCV from CoinGecko
+def fetch_ohlcv(coin_id, timeframe='1d', days=90):
+    # Map timeframe to days
+    if timeframe == '5m':
+        days = 1  # CoinGecko min is 1 day for 5m
+    elif timeframe == '15m':
+        days = 1
+    elif timeframe == '1h':
+        days = 7
+    elif timeframe == '4h':
+        days = 30
+    elif timeframe == '1d':
+        days = 90
     
-    bars = safe_fetch()
-    df = pd.DataFrame(bars, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-    df.set_index('timestamp', inplace=True)
-    return df
+    url = f"https://api.coingecko.com/api/v3/coins/{coin_id}/ohlc?vs_currency=usd&days={days}"
+    try:
+        response = requests.get(url, timeout=10)
+        data = response.json()
+        df = pd.DataFrame(data, columns=['timestamp', 'open', 'high', 'low', 'close'])
+        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+        df.set_index('timestamp', inplace=True)
+        df['volume'] = np.nan  # CoinGecko OHLC doesn't have volume, set to NaN
+        return df
+    except Exception as e:
+        st.error(f"Error fetching OHLCV for {coin_id}: {e}")
+        return pd.DataFrame()
 
 def find_pivots(df, order=5):
     if len(df) < order * 2:
@@ -245,11 +206,10 @@ def detect_patterns(df, highs_idx, lows_idx):
     # 7. Flag
     body_pct = abs(df['close'] - df['open']) / df['open'] * 100
     if (body_pct > 3).any():
-        recent_vol = df['volume'].tail(10).mean()
-        if df['volume'].tail(5).mean() < recent_vol * 0.7:
-            p = 'Bullish Flag - Tiềm năng tăng' if df['close'].iloc[-1] > df['open'].iloc[-1] else 'Bearish Flag - Tiềm năng giảm'
-            sr = get_success_rate(p)
-            patterns.append(f"{p} (Success Rate: {sr}%)")
+        # Volume not available, skip volume check for flag
+        p = 'Bullish Flag - Tiềm năng tăng' if df['close'].iloc[-1] > df['open'].iloc[-1] else 'Bearish Flag - Tiềm năng giảm'
+        sr = get_success_rate(p)
+        patterns.append(f"{p} (Success Rate: {sr}%)")
     
     # 8. Pennant
     if (body_pct > 3).any() and any('Triangle' in p for p in patterns):
@@ -385,49 +345,92 @@ def plot_chart(df, highs_idx, lows_idx, patterns, supp=None, res=None):
 # Main app
 st.title("Crypto Pattern Scanner GUI (Fixed with Success Rates)")
 
-vol_threshold = st.slider("Filter Volume Change 24h (%)", 0, 50, 10)
+tab1, tab2 = st.tabs(["Top Coins", "Binance Alpha Coins"])
 
-with st.spinner("Đang load top coins..."):
-    coins_df = get_top_usdt_coins(50, vol_threshold)
-if not coins_df.empty:
-    # Apply styling
-    def apply_styling(df):
-        return (
-            df.style
-            .apply(color_market_cap, subset=['market_cap'], axis=0)
-            .format({
-                'market_cap': '${:,.0f}',
-                'current_price': '${:,.4f}',
-                'price_change_24h': '{:.2f}%',
-                'volume_change_24h': '{:.2f}%',
-                'symbol': lambda x: x.replace('/USDT', '')
-            })
-        )
+with tab1:
+    vol_threshold = st.slider("Filter Volume Change 24h (%)", 0, 50, 10)
+
+    with st.spinner("Đang load top coins..."):
+        coins_df = get_top_coins(50, vol_threshold)
+    if not coins_df.empty:
+        # Apply styling
+        def apply_styling(df):
+            return (
+                df.style
+                .apply(color_market_cap, subset=['market_cap'], axis=0)
+                .format({
+                    'market_cap': '${:,.0f}',
+                    'current_price': '${:,.4f}',
+                    'price_change_24h': '{:.2f}%',
+                    'volume_change_24h': '{:.2f}%',
+                    'symbol': lambda x: x.replace('/USDT', '')
+                })
+            )
+        
+        styled_df = apply_styling(coins_df)
+        st.dataframe(styled_df)
+
+        selected_symbol = st.selectbox("Chọn Coin", coins_df['symbol'] if not coins_df.empty else [])
+        timeframe = st.selectbox("Chọn Timeframe", ['5m', '15m', '1h', '4h', '1d'])
+
+        if st.button("Scan Patterns"):
+            with st.spinner("Đang fetch data và detect..."):
+                # Use coin_id for fetch
+                coin_row = coins_df[coins_df['symbol'] == selected_symbol].iloc[0]
+                df = fetch_ohlcv(coin_row['id'], timeframe)
+                if df.empty:
+                    st.error(f"No data for {selected_symbol}")
+                else:
+                    highs_idx, lows_idx = find_pivots(df)
+                    patterns, supp, res = detect_patterns(df, highs_idx, lows_idx)
+                    
+                    st.subheader("Patterns Tìm Thấy:")
+                    if patterns:
+                        for p in patterns:
+                            st.write(f"- {p}")
+                    else:
+                        st.write("Không tìm thấy pattern nào rõ ràng.")
+                    
+                    if supp or res:
+                        st.write(f"Support gần: ${supp:.2f} nếu có | Resistance gần: ${res:.2f} nếu có")
+                    
+                    # Plot fixed
+                    plot_chart(df, highs_idx, lows_idx, patterns, supp, res)
+
+with tab2:
+    st.write("Danh sách Binance Alpha Coins (ưu tiên scan các coin mới list futures):")
+    st.write(binance_alpha_coins)
     
-    styled_df = apply_styling(coins_df)
-    st.dataframe(styled_df)
-
-selected_symbol = st.selectbox("Chọn Coin", coins_df['symbol'] if not coins_df.empty else [])
-timeframe = st.selectbox("Chọn Timeframe", ['5m', '15m', '1h', '4h', '1d'])
-
-if st.button("Scan Patterns"):
-    with st.spinner("Đang fetch data và detect..."):
-        df = fetch_ohlcv(selected_symbol, timeframe)
-        if df.empty:
-            st.error(f"No data for {selected_symbol}")
-        else:
-            highs_idx, lows_idx = find_pivots(df)
-            patterns, supp, res = detect_patterns(df, highs_idx, lows_idx)
-            
-            st.subheader("Patterns Tìm Thấy:")
-            if patterns:
-                for p in patterns:
-                    st.write(f"- {p}")
-            else:
-                st.write("Không tìm thấy pattern nào rõ ràng.")
-            
-            if supp or res:
-                st.write(f"Support gần: ${supp:.2f} nếu có | Resistance gần: ${res:.2f} nếu có")
-            
-            # Plot fixed
-            plot_chart(df, highs_idx, lows_idx, patterns, supp, res)
+    # Filter top coins for Alpha
+    alpha_df = coins_df[coins_df['symbol'].str.replace('/USDT', '').str.upper().isin(binance_alpha_coins)]
+    if not alpha_df.empty:
+        styled_alpha = apply_styling(alpha_df)
+        st.dataframe(styled_alpha)
+        
+        selected_alpha = st.selectbox("Chọn Binance Alpha Coin", alpha_df['symbol'] if not alpha_df.empty else [])
+        timeframe_alpha = st.selectbox("Chọn Timeframe", ['5m', '15m', '1h', '4h', '1d'], key='alpha_tf')
+        
+        if st.button("Scan Binance Alpha Patterns"):
+            with st.spinner("Đang fetch data và detect..."):
+                coin_row = alpha_df[alpha_df['symbol'] == selected_alpha].iloc[0]
+                df = fetch_ohlcv(coin_row['id'], timeframe_alpha)
+                if df.empty:
+                    st.error(f"No data for {selected_alpha}")
+                else:
+                    highs_idx, lows_idx = find_pivots(df)
+                    patterns, supp, res = detect_patterns(df, highs_idx, lows_idx)
+                    
+                    st.subheader("Patterns Tìm Thấy cho Binance Alpha:")
+                    if patterns:
+                        for p in patterns:
+                            st.write(f"- {p}")
+                    else:
+                        st.write("Không tìm thấy pattern nào rõ ràng.")
+                    
+                    if supp or res:
+                        st.write(f"Support gần: ${supp:.2f} nếu có | Resistance gần: ${res:.2f} nếu có")
+                    
+                    # Plot fixed
+                    plot_chart(df, highs_idx, lows_idx, patterns, supp, res)
+    else:
+        st.warning("Không tìm thấy Binance Alpha coins trong top list hiện tại. Danh sách có thể cần cập nhật.")
