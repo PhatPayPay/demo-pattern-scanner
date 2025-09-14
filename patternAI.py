@@ -343,7 +343,7 @@ def plot_chart(df, highs_idx, lows_idx, patterns, supp=None, res=None):
     st.pyplot(fig)  # Fixed: use fig directly, as returnfig=True returns (fig, axes)
 
 # Main app
-st.title("Crypto Pattern Scanner GUI (Fixed with Success Rates)")
+st.title("Crypto Pattern SAGE")
 
 tab1, tab2 = st.tabs(["Top Coins", "Binance Alpha Coins"])
 
