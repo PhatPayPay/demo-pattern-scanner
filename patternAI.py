@@ -8,6 +8,7 @@ import matplotlib.pyplot as plt
 import mplfinance as mpf
 import requests  # Added for fetching market cap from CoinGecko
 from datetime import datetime
+import time  # For retry delays
 
 # Success rates from the uploaded image
 success_rates = {
@@ -43,66 +44,106 @@ def color_market_cap(series):
     styles[is_na] = ''
     return styles
 
-# Updated to add market_cap
-@st.cache_data
-def get_top_usdt_coins(n=50, vol_change_threshold=10):
-    exchange = ccxt.binance({'enableRateLimit': True})
-    markets = exchange.load_markets()
-    usdt_symbols = [s for s in markets if s.endswith('/USDT') and markets[s]['active']]
-    
-    tickers = exchange.fetch_tickers(usdt_symbols)
-    sorted_tickers = sorted(tickers.items(), key=lambda x: x[1].get('quoteVolume', 0), reverse=True)[:n*2]
-    
-    # Fetch top coins market cap from CoinGecko
-    cg_url = "https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=market_cap_desc&per_page=100&page=1&sparkline=false"
-    try:
-        cg_response = requests.get(cg_url)
-        cg_data = cg_response.json()
-        cg_dict = {coin['symbol'].upper(): coin['market_cap'] for coin in cg_data if coin['market_cap']}
-    except Exception as e:
-        st.warning(f"Error fetching market caps: {e}. Market cap will be N/A.")
-        cg_dict = {}
-    
-    results = []
-    for symbol, ticker in sorted_tickers:
+# Retry function for ccxt calls
+def retry_ccxt_call(func, max_retries=3, delay=5):
+    for attempt in range(max_retries):
         try:
-            ohlcv_1d = exchange.fetch_ohlcv(symbol, '1d', limit=2)
-            if len(ohlcv_1d) < 2:
-                continue
-            prev_vol = ohlcv_1d[0][5]
-            curr_vol = ohlcv_1d[1][5]
-            vol_change = ((curr_vol - prev_vol) / prev_vol * 100) if prev_vol > 0 else 0
-            
-            price_change = ticker.get('percentage', 0)
-            current_price = ticker.get('last', 0)
-            
-            # Get market cap
-            coin_symbol = symbol.split('/')[0].upper()  # e.g., 'BTC'
-            market_cap_raw = cg_dict.get(coin_symbol, np.nan)
-            market_cap = float(market_cap_raw) if not pd.isna(market_cap_raw) else np.nan
-            
-            results.append({
-                'symbol': symbol,
-                'current_price': current_price,
-                'price_change_24h': price_change,
-                'volume_change_24h': vol_change,
-                'market_cap': market_cap
-            })
-            
-            if len(results) >= n:
-                break
+            return func()
+        except ccxt.NetworkError as e:
+            if attempt < max_retries - 1:
+                st.warning(f"Network error on attempt {attempt + 1}: {str(e)}. Retrying in {delay}s...")
+                time.sleep(delay)
+                delay *= 2  # Exponential backoff
+            else:
+                raise e
+        except ccxt.ExchangeNotAvailable as e:
+            if attempt < max_retries - 1:
+                st.warning(f"Exchange unavailable on attempt {attempt + 1}: {str(e)}. Retrying in {delay}s...")
+                time.sleep(delay)
+                delay *= 2
+            else:
+                raise e
         except Exception as e:
-            pass
+            raise e
+
+# Updated to add market_cap and retry logic
+@st.cache_data(ttl=300)  # Cache for 5 minutes to reduce API calls
+def get_top_usdt_coins(n=50, vol_change_threshold=10):
+    def safe_fetch():
+        exchange = ccxt.binance({
+            'enableRateLimit': True,
+            'timeout': 30000,  # 30s timeout
+            'options': {'defaultType': 'spot'}
+        })
+        
+        # Retry load_markets
+        markets = retry_ccxt_call(lambda: exchange.load_markets())
+        usdt_symbols = [s for s in markets if s.endswith('/USDT') and markets[s]['active']]
+        
+        # Retry fetch_tickers
+        tickers = retry_ccxt_call(lambda: exchange.fetch_tickers(usdt_symbols))
+        sorted_tickers = sorted(tickers.items(), key=lambda x: x[1].get('quoteVolume', 0), reverse=True)[:n*2]
+        
+        # Fetch top coins market cap from CoinGecko (more reliable, no retry needed usually)
+        cg_url = "https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=market_cap_desc&per_page=100&page=1&sparkline=false"
+        try:
+            cg_response = requests.get(cg_url, timeout=10)
+            cg_data = cg_response.json()
+            cg_dict = {coin['symbol'].upper(): coin['market_cap'] for coin in cg_data if coin['market_cap']}
+        except Exception as e:
+            st.warning(f"Error fetching market caps: {e}. Market cap will be N/A.")
+            cg_dict = {}
+        
+        results = []
+        for symbol, ticker in sorted_tickers:
+            try:
+                # Retry ohlcv fetch
+                ohlcv_1d = retry_ccxt_call(lambda: exchange.fetch_ohlcv(symbol, '1d', limit=2))
+                if len(ohlcv_1d) < 2:
+                    continue
+                prev_vol = ohlcv_1d[0][5]
+                curr_vol = ohlcv_1d[1][5]
+                vol_change = ((curr_vol - prev_vol) / prev_vol * 100) if prev_vol > 0 else 0
+                
+                price_change = ticker.get('percentage', 0)
+                current_price = ticker.get('last', 0)
+                
+                # Get market cap
+                coin_symbol = symbol.split('/')[0].upper()  # e.g., 'BTC'
+                market_cap_raw = cg_dict.get(coin_symbol, np.nan)
+                market_cap = float(market_cap_raw) if not pd.isna(market_cap_raw) else np.nan
+                
+                results.append({
+                    'symbol': symbol,
+                    'current_price': current_price,
+                    'price_change_24h': price_change,
+                    'volume_change_24h': vol_change,
+                    'market_cap': market_cap
+                })
+                
+                if len(results) >= n:
+                    break
+            except Exception as e:
+                st.error(f"Error processing {symbol}: {e}")
+                continue
+        
+        filtered = [r for r in results if abs(r['volume_change_24h']) > vol_change_threshold]
+        if not filtered:
+            st.warning(f"Không coin nào thỏa filter volume change > {vol_change_threshold}%. Hiển thị top mà không filter.")
+            return pd.DataFrame(results)
+        return pd.DataFrame(filtered)
     
-    filtered = [r for r in results if abs(r['volume_change_24h']) > vol_change_threshold]
-    if not filtered:
-        st.warning(f"Không coin nào thỏa filter volume change > {vol_change_threshold}%. Hiển thị top mà không filter.")
-        return pd.DataFrame(results)
-    return pd.DataFrame(filtered)
+    return safe_fetch()
 
 def fetch_ohlcv(symbol, timeframe='1d', limit=500):
-    exchange = ccxt.binance()
-    bars = exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
+    exchange = ccxt.binance({
+        'enableRateLimit': True,
+        'timeout': 30000
+    })
+    def safe_fetch():
+        return retry_ccxt_call(lambda: exchange.fetch_ohlcv(symbol, timeframe, limit=limit))
+    
+    bars = safe_fetch()
     df = pd.DataFrame(bars, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
     df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
     df.set_index('timestamp', inplace=True)
@@ -338,7 +379,7 @@ def plot_chart(df, highs_idx, lows_idx, patterns, supp=None, res=None):
     
     fig, axes = mpf.plot(df, type='candle', volume=True, addplot=ap, returnfig=True, 
                          title=f"Chart Patterns: {', '.join(patterns[:3])}...", style='charles')
-    st.pyplot(fig)  # Fixed: remove [0].figure
+    st.pyplot(fig)  # Fixed: use fig directly, as returnfig=True returns (fig, axes)
 
 # Main app
 st.title("Crypto Pattern Scanner GUI (Fixed with Success Rates)")
