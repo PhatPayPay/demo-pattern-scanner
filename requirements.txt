@@ -1,0 +1,8 @@
+streamlit
+ccxt
+pandas
+numpy
+scipy
+matplotlib
+mplfinance
+requests
