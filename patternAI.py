@@ -66,11 +66,11 @@ def retry_ccxt_call(func, max_retries=3, delay=5):
         except Exception as e:
             raise e
 
-# Updated to add market_cap and retry logic
+# Updated to add market_cap and retry logic, switched to Bybit
 @st.cache_data(ttl=300)  # Cache for 5 minutes to reduce API calls
 def get_top_usdt_coins(n=50, vol_change_threshold=10):
     def safe_fetch():
-        exchange = ccxt.binance({
+        exchange = ccxt.bybit({
             'enableRateLimit': True,
             'timeout': 30000,  # 30s timeout
             'options': {'defaultType': 'spot'}
@@ -78,7 +78,7 @@ def get_top_usdt_coins(n=50, vol_change_threshold=10):
         
         # Retry load_markets
         markets = retry_ccxt_call(lambda: exchange.load_markets())
-        usdt_symbols = [s for s in markets if s.endswith('/USDT') and markets[s]['active']]
+        usdt_symbols = [s for s in markets if s.endswith('/USDT') and markets[s]['active'] and markets[s]['spot']]
         
         # Retry fetch_tickers
         tickers = retry_ccxt_call(lambda: exchange.fetch_tickers(usdt_symbols))
@@ -136,9 +136,10 @@ def get_top_usdt_coins(n=50, vol_change_threshold=10):
     return safe_fetch()
 
 def fetch_ohlcv(symbol, timeframe='1d', limit=500):
-    exchange = ccxt.binance({
+    exchange = ccxt.bybit({
         'enableRateLimit': True,
-        'timeout': 30000
+        'timeout': 30000,
+        'options': {'defaultType': 'spot'}
     })
     def safe_fetch():
         return retry_ccxt_call(lambda: exchange.fetch_ohlcv(symbol, timeframe, limit=limit))
